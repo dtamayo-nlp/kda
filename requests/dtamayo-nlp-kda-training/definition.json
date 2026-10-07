@@ -1,0 +1,192 @@
+{
+  "name": "kda_train_fwd_bwd_perchannel_safegate_h128",
+  "op_type": "kda_chunk_train",
+  "description": "One KDA training step (forward + backward): packed varlen sequences, in-kernel q/k L2 norm, in-kernel beta sigmoid, per-channel A_log safe decay gate g = -5*sigmoid(exp(A_log)*(g_raw+dt_bias)), zero initial state, no final state. Outputs are the attention output and every input gradient for a given upstream gradient do.",
+  "tags": [
+    "kda",
+    "linear_attention",
+    "delta_rule",
+    "training",
+    "backward",
+    "varlen"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "const",
+      "value": 1,
+      "description": "Packed (THD) layout: always 1."
+    },
+    "total_tokens": {
+      "type": "var",
+      "description": "Total packed tokens in the THD layout."
+    },
+    "num_heads": {
+      "type": "var",
+      "description": "KDA heads. q/k and v head counts are equal."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "gate_dim": {
+      "type": "var",
+      "description": "num_heads * head_dim (flattened per-channel gate parameters)."
+    },
+    "num_seqs_plus_one": {
+      "type": "var",
+      "description": "Number of packed documents + 1."
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Queries before L2 norm."
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Keys before L2 norm."
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "g": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw per-channel decay pre-activation."
+    },
+    "beta": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Beta logits; sigmoid applied in kernel."
+    },
+    "A_log": {
+      "shape": [
+        "gate_dim"
+      ],
+      "dtype": "float32",
+      "description": "Per-channel decay scale (one value per head and key channel)."
+    },
+    "dt_bias": {
+      "shape": [
+        "gate_dim"
+      ],
+      "dtype": "float32"
+    },
+    "cu_seqlens": {
+      "shape": [
+        "num_seqs_plus_one"
+      ],
+      "dtype": "int64",
+      "description": "Document boundaries; 0 first, total_tokens last."
+    },
+    "do": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Upstream gradient of the output."
+    }
+  },
+  "outputs": {
+    "o": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dq": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dk": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dv": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dg": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dbeta": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_heads"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dA_log": {
+      "shape": [
+        "gate_dim"
+      ],
+      "dtype": "float32"
+    },
+    "ddt_bias": {
+      "shape": [
+        "gate_dim"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "constraints": [
+    "gate_dim == num_heads * head_dim",
+    "num_seqs_plus_one >= 2"
+  ],
+  "reference": "# SPDX-License-Identifier: Apache-2.0\nimport torch\nfrom torch.utils.checkpoint import checkpoint\n\nLOWER_BOUND = -5.0  # safe gate g_min\nL2_EPS = 1e-6       # FLA l2norm eps\nBLOCK = 256         # recurrence steps per checkpointed block (memory only)\n\n\ndef _block(S, q, k, v, a, b, starts):\n    outs = []\n    for t in range(q.shape[0]):\n        if t in starts:  # first token of a packed document: state restarts at zero\n            S = torch.zeros_like(S)\n        S = S * a[t].exp()[..., None]\n        kS = torch.einsum(\"hk,hkv->hv\", k[t], S)\n        S = S + torch.einsum(\"hk,hv->hkv\", b[t][:, None] * k[t], v[t] - kS)\n        outs.append(torch.einsum(\"hk,hkv->hv\", q[t], S))\n    return S, torch.stack(outs)\n\n\ndef run(q, k, v, g, beta, A_log, dt_bias, cu_seqlens, do):\n    with torch.enable_grad():\n        leaves = [x.detach().float().requires_grad_() for x in (q, k, v, g, beta, A_log, dt_bias)]\n        qf, kf, vf, gf, bf, Af, df = leaves\n        _, T, H, K = qf.shape\n        qn = qf[0] * torch.rsqrt((qf[0] * qf[0]).sum(-1, keepdim=True) + L2_EPS) * K ** -0.5\n        kn = kf[0] * torch.rsqrt((kf[0] * kf[0]).sum(-1, keepdim=True) + L2_EPS)\n        # per-channel safe gate, log-space decay in [LOWER_BOUND, 0)\n        a = LOWER_BOUND * torch.sigmoid(Af.exp().view(H, K) * (gf[0] + df.view(H, K)))\n        b = torch.sigmoid(bf[0])\n        starts_all = set(int(x) for x in cu_seqlens.tolist())\n        S = qn.new_zeros(H, K, vf.shape[-1])\n        outs = []\n        for s in range(0, T, BLOCK):\n            e = min(T, s + BLOCK)\n            st = frozenset(t - s for t in range(s, e) if t in starts_all)\n            S, o_blk = checkpoint(_block, S, qn[s:e], kn[s:e], vf[0, s:e], a[s:e], b[s:e], st,\n                                  use_reentrant=False)\n            outs.append(o_blk)\n        o = torch.cat(outs)[None]\n        grads = torch.autograd.grad(o, leaves, grad_outputs=do.float())\n    dq, dk, dv, dg, dbeta, dA, ddt = grads\n    bf16 = torch.bfloat16\n    out = (o.to(bf16), dq.to(bf16), dk.to(bf16), dv.to(bf16), dg.to(bf16), dbeta.to(bf16),\n            dA.float(), ddt.float())\n    return tuple(t.detach() for t in out)\n"
+}
